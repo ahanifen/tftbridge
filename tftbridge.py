@@ -26,8 +26,21 @@
 #     5000 bytes (V27 CMD_MAX_REV) and Klipper's full list (~1000 files) overflowed both it and the
 #     Klipper pty (lost "End file list" -> TFT stuck loading). The TFT also cuts names at the first
 #     space, so spaces are shown as "_" and M23 maps the shown name back to the real file.
+# Added 2026-11-22 for TFT firmware V28 (Touch-mode menus that expect Marlin):
+#   - Tuning: PID (M303 -> PID_CALIBRATE, "PID Autotune finished/failed"), Tune extruder (M92 query
+#     answered from rotation_distance; "M92 E" -> SET_EXTRUDER_ROTATION_DISTANCE, live only)
+#   - Leveling (Cap:AUTOLEVEL:1): ABL (G29 + "ABL Completed"), Level corner (G30 -> PROBE, reply
+#     "Bed X: Y: Z:"), BLTouch (M280 -> BLTOUCH_DEBUG, M48 -> PROBE_ACCURACY "Mean"/"Standard
+#     Deviation"), Z align (G34 -> Z_TILT_ADJUST), Mesh editor (M420 V1 T1 -> Klipper's mesh as a
+#     Marlin bilinear grid, view only)
+#   - Parameter settings: M503 is answered with Klipper's live values (read only; edits are refused)
+#   - M851/M206 answered, M150 -> _TFT_LED_COLOR macro, M81/G26/G42/M421/EEPROM -> "not supported"
+#   - SCREWS_TILT_CALCULATE results are summarised as one notification
+#   Replies Klipper sends for a translated command are rewritten on the way back (see Pending):
+#   each forwarded line is matched to Klipper's "ok" in order, and extra "ok"s of multi-line
+#   translations are dropped so the TFT sees exactly one per command.
 #
-import logging, os, threading, time
+import collections, logging, math, os, re, threading, time
 import serial
 
 M20_MAX_BYTES = 4200    # stay well under the TFT's 5000-byte buffer
@@ -36,7 +49,24 @@ GCODE_EXTS = ("gcode", "g", "gco")
 READ_TIMEOUT = 0.2      # seconds; lets the threads notice a stop request
 WATCH_INTERVAL = 1.0    # seconds between print-state checks for host actions
 # Marlin commands the TFT sends that Klipper doesn't implement: acknowledge, do nothing
-SWALLOW = {"M92", "M503", "M150", "M108", "M876", "M155", "M211", "M420"}
+SWALLOW = {"M108", "M876", "M155", "M211", "M420"}
+# Marlin settings commands: Klipper keeps these in printer.cfg, so the TFT's editors are read only
+READ_ONLY = {"M200", "M201", "M203", "M204", "M205", "M207", "M208", "M209", "M218", "M301", "M304",
+             "M900", "M906", "M913", "M914", "M500", "M501", "M502", "M421", "M206"}
+NOT_SUPPORTED = {"G26": "Mesh validation pattern (G26)", "G42": "Mesh tuner (G42)",
+                 "M81": "Power off: use Mainsail", "M401": "BLTouch HS mode", "M355": "Case light"}
+BLTOUCH = {10: "pin_down", 90: "pin_up", 120: "self_test", 160: "reset"}
+PROBE_AT = re.compile(r"probe at ([-\d.]+),([-\d.]+) is z=([-\d.]+)")
+ACCURACY = re.compile(r"probe accuracy results: .*average ([-\d.]+), median [-\d.]+, standard deviation ([-\d.]+)")
+SCREW = re.compile(r"^// (.+?) (?:\(base\) )?: x=[-\d.]+, y=[-\d.]+, z=[-\d.]+(?: : adjust (CW|CCW) (\d+):(\d+))?")
+
+class Pending:
+    """One line forwarded to Klipper: how many "ok"s it produces and how its replies are rewritten."""
+    def __init__(self, oks=1, filt=None, done=None):
+        self.oks = oks          # Klipper "ok"s to expect (multi-line translations send several)
+        self.filt = filt        # line -> list of lines for the TFT (None = forward unchanged)
+        self.done = done        # (had_error) -> extra lines sent before the final "ok"
+        self.error = False
 
 class TftBridge:
     def __init__(self, config):
@@ -60,6 +90,7 @@ class TftBridge:
         self.stopEvent = threading.Event()
         self.threads = []
         self.seenUnknown = set()
+        self.pending = collections.deque()
         self.printer.register_event_handler("klippy:ready", self.handle_ready)
         self.printer.register_event_handler("klippy:disconnect", self.handle_disconnect)
 
@@ -73,6 +104,12 @@ class TftBridge:
         self.displayStatus = self.printer.lookup_object('display_status', None)
         self.partFan = self.printer.lookup_object('fan_generic fan0', None)
         self.settings = self.printer.lookup_object('gcode_macro _USER_SETTINGS', None)
+        self.toolhead = self.printer.lookup_object('toolhead', None)
+        self.extruder = self.printer.lookup_object('extruder', None)
+        self.probe = self.printer.lookup_object('probe', None)
+        self.bedMesh = self.printer.lookup_object('bed_mesh', None)
+        self.configfile = self.printer.lookup_object('configfile', None)
+        self.pending = collections.deque()
         try:
             self.tftSerial = serial.Serial(self.tftDevice, self.tftBaud, timeout=READ_TIMEOUT)
             self.klipperSerial = serial.Serial(self.klipperDevice, self.klipperBaud, timeout=READ_TIMEOUT)
@@ -113,6 +150,11 @@ class TftBridge:
     def to_klipper(self, text):
         self.klipperSerial.write(text.encode())
 
+    def send(self, text, pending):
+        """Forward to Klipper and remember how to treat its replies (queued before writing)."""
+        self.pending.append(pending)
+        self.to_klipper(text)
+
     def status_reply(self, cmd, words=()):
         """Reply for status polls answered locally, or None to forward to Klipper."""
         now = self.reactor.monotonic()
@@ -143,8 +185,102 @@ class TftBridge:
             return ("FIRMWARE_NAME:Klipper %s FIRMWARE_VERSION:%s MACHINE_TYPE:Ender-3 Pro\n"
                     # Cap:BABYSTEPPING:1 as in oterek/klipper-btt-tft-bridge (MIT), see NOTICE
                     "Cap:SDCARD:1\nCap:AUTOREPORT_SD_STATUS:0\nCap:AUTOREPORT_TEMP:0\nCap:BABYSTEPPING:1\n"
-                    "Cap:EEPROM:0\nCap:PROMPT_SUPPORT:0\nok\n" % (version, version))
+                    "Cap:EEPROM:0\nCap:PROMPT_SUPPORT:0\nCap:AUTOLEVEL:%d\nCap:Z_PROBE:%d\nok\n"
+                    % (version, version, self.bedMesh is not None, self.probe is not None))
+        if cmd == "M503":
+            return self.settings_dump() + "ok\n"
+        if cmd == "M92" and len(words) == 1:
+            return self.steps_line() + "ok\n"
+        if cmd == "M851" and self.probe is not None:
+            # query, or the Z the Babystep menu sends on exit: Klipper's z_offset lives in printer.cfg
+            return self.probe_line() + "ok\n"
+        if cmd == "M206" and len(words) == 1:
+            return "M206 X0.00 Y0.00 Z0.00\nok\n"
+        if cmd == "M420" and any(w.upper() == "V1" for w in words[1:]):
+            return self.mesh_report() + "ok\n"
+        if cmd == "M401" and any(w.upper() == "H" for w in words[1:]):
+            return "ok\n"                  # no HS mode query; the TFT then stows the pin with M280 S90
+        if cmd in READ_ONLY and not (cmd == "M92"):
+            return "echo:%s is read only with Klipper: change it in printer.cfg\nok\n" % (cmd,)
+        if cmd in NOT_SUPPORTED:
+            return "echo:%s is not supported with Klipper\nok\n" % (NOT_SUPPORTED[cmd],)
         return None
+
+    # ---------- Marlin-style reports built from Klipper's state ----------
+    def cfg(self, section, option, default=None):
+        try:
+            return self.configfile.get_status(None)['settings'][section].get(option, default)
+        except Exception:
+            return default
+
+    def axis_steps(self):
+        steps = {}
+        if self.toolhead is not None:
+            for s in self.toolhead.get_kinematics().get_steppers():
+                name = s.get_name()
+                if name in ("stepper_x", "stepper_y", "stepper_z"):
+                    steps[name[-1].upper()] = 1. / s.get_step_dist()
+        if self.extruder is not None and self.extruder.extruder_stepper is not None:
+            steps["E"] = 1. / self.extruder.extruder_stepper.stepper.get_step_dist()
+        return steps
+
+    def steps_line(self):
+        st = self.axis_steps()
+        return "M92 " + " ".join("%s%.2f" % (a, st[a]) for a in "XYZE" if a in st) + "\n"
+
+    def probe_line(self):
+        x, y, z = self.probe.get_offsets()
+        return "M851 X%.2f Y%.2f Z%.2f\n" % (x, y, -z)     # Marlin: nozzle below the trigger point is negative
+
+    def settings_dump(self):
+        """M503 replay lines the TFT's Parameter settings menu parses (values only, read only)."""
+        out = [self.steps_line()]
+        if self.toolhead is not None:
+            th = self.toolhead.get_status(self.reactor.monotonic())
+            v, a = th['max_velocity'], th['max_accel']
+            zv = float(self.cfg('printer', 'max_z_velocity', v))
+            za = float(self.cfg('printer', 'max_z_accel', a))
+            ev = getattr(self.extruder, 'max_e_velocity', 0.) if self.extruder else 0.
+            ea = getattr(self.extruder, 'max_e_accel', 0.) if self.extruder else 0.
+            out.append("M203 X%.2f Y%.2f Z%.2f E%.2f\n" % (v, v, zv, ev))
+            out.append("M201 X%d Y%d Z%d E%d\n" % (a, a, za, ea))
+            out.append("M204 P%.2f R%.2f T%.2f\n" % (a, ea or a, a))
+        for cmd, sec in (("M301", "extruder"), ("M304", "heater_bed")):
+            kp, ki, kd = (self.cfg(sec, k) for k in ("pid_kp", "pid_ki", "pid_kd"))
+            if kp is not None:
+                out.append("%s P%.2f I%.2f D%.2f\n" % (cmd, float(kp), float(ki), float(kd)))
+        if self.probe is not None:
+            out.append(self.probe_line())
+        if self.extruder is not None:
+            pa = self.extruder.get_status(self.reactor.monotonic()).get('pressure_advance')
+            if pa is not None:
+                out.append("M900 K%.4f\n" % (pa,))
+        cur = {}
+        for name in ("stepper_x", "stepper_y", "stepper_z", "stepper_z1", "extruder"):
+            c = self.cfg("tmc2209 " + name, "run_current")
+            if c is not None:
+                cur[name] = int(round(float(c) * 1000))
+        if cur:
+            xyz = " ".join("%s%d" % (n[-1].upper(), cur[n]) for n in ("stepper_x", "stepper_y", "stepper_z") if n in cur)
+            out.append("M906 %s\n" % (xyz,))
+            if "stepper_z1" in cur:
+                out.append("M906 I1 Z%d\n" % (cur["stepper_z1"],))
+            if "extruder" in cur:
+                out.append("M906 T0 E%d\n" % (cur["extruder"],))
+        return "".join(out)
+
+    def mesh_report(self):
+        """Klipper's active mesh as Marlin's "Bilinear Leveling Grid" (the Mesh editor parses it)."""
+        if self.bedMesh is None:
+            return "Invalid mesh\n"
+        m = self.bedMesh.get_status(self.reactor.monotonic()).get('probed_matrix') or [[]]
+        if not m or not m[0]:
+            return "Invalid mesh\n"
+        cols = len(m[0])
+        lines = ["Bilinear Leveling Grid:\n", "      " + "".join("%7d" % i for i in range(cols)) + "\n"]
+        for j, row in enumerate(m):
+            lines.append("%2d " % j + " ".join("%+.3f" % z for z in row) + "\n")
+        return "".join(lines)
 
     def file_list_reply(self):
         """Newest gcode files first, as many as fit the TFT's buffer."""
@@ -177,6 +313,59 @@ class TftBridge:
         return head + "".join(lines) + tail
 
     def translated(self, cmd, line):
+        """Returns the text for Klipper, or (text, Pending) when replies must be rewritten, or None."""
+        words = line.strip().split()
+        args = {}
+        for w in words[1:]:
+            if w[:1].isalpha():
+                args[w[0].upper()] = w[1:]
+        if cmd == "M303":           # PID autotune from Tuning -> PID
+            heater = "heater_bed" if args.get("E", "0").startswith("-") else "extruder"
+            target = args.get("S", "200")
+            done = lambda err: ["PID Autotune %s\n" % ("failed" if err else "finished")]
+            return ("PID_CALIBRATE HEATER=%s TARGET=%s\n" % (heater, target), Pending(done=done))
+        if cmd == "M92":
+            # Tune extruder (and the Parameter settings editor) set E steps/mm: apply it live as a
+            # rotation_distance; X/Y/Z are refused
+            if "E" in args and self.extruder is not None and not any(a in args for a in "XYZ"):
+                try:
+                    new_steps = float(args["E"])
+                    rd, spr = self.extruder.extruder_stepper.stepper.get_rotation_distance()
+                    new_rd = spr / new_steps
+                except (ValueError, ZeroDivisionError):
+                    return None
+                note = lambda err: [] if err else [
+                    "echo:rotation_distance %.4f applied (live). Put it in the [extruder] config to keep it\n" % (new_rd,)]
+                return ("SET_EXTRUDER_ROTATION_DISTANCE EXTRUDER=extruder DISTANCE=%.4f\n" % (new_rd,),
+                        Pending(done=note))
+            self.to_tft("echo:M92 X/Y/Z is read only with Klipper: change it in printer.cfg\n")
+            return None
+        if cmd == "G29":            # ABL start (G28 comes first from the TFT)
+            return "BED_MESH_CALIBRATE\n"
+        if cmd == "M118" and "ABL Completed" in line:
+            # queued behind G29 in Klipper, so the TFT hears it when the mesh is really done
+            filt = lambda l: ["ABL Completed\n"] if "ABL Completed" in l else [l]
+            return ("M118 ABL Completed\n", Pending(filt=filt))
+        if cmd == "G30":            # Level corner / probe offset: probe at a bed position
+            return self.probe_at(args)
+        if cmd == "M48":
+            return ("PROBE_ACCURACY\n", Pending(filt=self.accuracy_filter))
+        if cmd == "PROBE_ACCURACY":
+            return (line, Pending(filt=self.accuracy_filter))
+        if cmd == "M280":
+            try:
+                c = BLTOUCH.get(int(float(args.get("S", "-1"))))
+            except ValueError:
+                c = None
+            return "BLTOUCH_DEBUG COMMAND=%s\n" % (c,) if c else None
+        if cmd == "G34":            # Z align
+            return "Z_TILT_ADJUST\n"
+        if cmd == "M150":
+            r, g, b = (float(args.get(k, "0") or 0) for k in ("R", "U", "B"))
+            p = float(args.get("P", "255") or 255) / 255.
+            return "_TFT_LED_COLOR R=%.3f G=%.3f B=%.3f\n" % (r / 255. * p, g / 255. * p, b / 255. * p)
+        if cmd == "SCREWS_TILT_CALCULATE":
+            return (line, self.screws_pending())
         if cmd == "M23":
             shown = line.strip().split(None, 1)[1].strip() if len(line.split()) > 1 else ""
             real = self.nameMap.get(shown.lstrip('/').lower())
@@ -202,6 +391,51 @@ class TftBridge:
             return None
         return line
 
+    def probe_at(self, args):
+        """Marlin "G30 X Y" probes with the probe over X,Y and reports "Bed X: Y: Z:"."""
+        if self.probe is None:
+            return None
+        try:
+            x, y = float(args["X"]), float(args["Y"])
+        except (KeyError, ValueError):
+            return None
+        xo, yo, zo = self.probe.get_offsets()
+        state = {}
+        def filt(l):
+            m = PROBE_AT.search(l)
+            if m:
+                state['z'] = float(m.group(3))
+            return [l]
+        def done(err):
+            if err or 'z' not in state:
+                return ["Z Probe Past Bed\n"]        # ends the TFT's wait for this point
+            return ["Bed X: %.3f Y: %.3f Z: %.3f\n" % (x, y, state['z'])]
+        script = "G90\nG1 Z10 F600\nG1 X%.3f Y%.3f F6000\nPROBE\n" % (x - xo, y - yo)
+        return (script, Pending(oks=4, filt=filt, done=done))
+
+    def accuracy_filter(self, l):
+        m = ACCURACY.search(l)
+        if m:
+            return [l, "Mean: %s\n" % (m.group(1),), "Standard Deviation: %s\n" % (m.group(2),)]
+        return [l]
+
+    def screws_pending(self):
+        found = []
+        def filt(l):
+            m = SCREW.match(l.strip())
+            if m:
+                name = "".join(w[0].upper() for w in m.group(1).split()[:2])   # "Rear left screw" -> RL
+                if m.group(2) is None:
+                    found.append("%s base" % (name,))
+                else:
+                    found.append("%s %s %d:%02d" % (name, m.group(2), int(m.group(3)), int(m.group(4))))
+            return [l]
+        def done(err):
+            if err or not found:
+                return []
+            return ["//action:notification Screws: %s\n" % (", ".join(found),)]
+        return Pending(filt=filt, done=done)
+
     # ---------- threads ----------
     def tft2klipper(self):
         while not self.stopEvent.is_set():
@@ -221,7 +455,7 @@ class TftBridge:
             cmd = words[0].upper() if words else ""
             try:
                 if "*" in line:
-                    self.to_klipper(line)
+                    self.send(line, Pending())
                     continue
                 if self.answerLocal:
                     reply = self.status_reply(cmd, words)
@@ -237,8 +471,10 @@ class TftBridge:
                 out = self.translated(cmd, line) if self.translate else line
                 if out is None:
                     self.to_tft("ok\n")     # nothing for Klipper to do (e.g. M290 without Z)
+                elif isinstance(out, tuple):
+                    self.send(*out)
                 else:
-                    self.to_klipper(out)
+                    self.send(out, Pending())
             except Exception:
                 logging.exception("tftbridge: forwarding %r failed", line)
 
@@ -247,11 +483,41 @@ class TftBridge:
             try:
                 raw = self.klipperSerial.readline()
                 if raw:
-                    with self.writeLock:
-                        self.tftSerial.write(raw)
+                    self.from_klipper(raw.decode('ascii', 'replace'))
             except Exception:
                 logging.exception("tftbridge: Klipper->TFT forward failed")
                 time.sleep(1.0)
+
+    def from_klipper(self, line):
+        """Pass one Klipper line to the TFT, rewriting replies of translated commands."""
+        p = self.pending[0] if self.pending else None
+        if p is None:
+            self.to_tft(line)
+            return
+        text = line.strip()
+        if text == "ok" or text.startswith("ok "):
+            p.oks -= 1
+            if p.oks > 0:
+                return                          # inner line of a multi-line translation
+            self.pending.popleft()
+            out = []
+            if p.done is not None:
+                try:
+                    out = p.done(p.error)
+                except Exception:
+                    logging.exception("tftbridge: reply rewrite failed")
+            self.to_tft("".join(out) + line)
+            return
+        if text.startswith("!!"):
+            p.error = True
+        out = [line]
+        if p.filt is not None:
+            try:
+                out = p.filt(line)
+            except Exception:
+                logging.exception("tftbridge: reply rewrite failed")
+        if out:
+            self.to_tft("".join(out))
 
     def fan_report(self):
         """Part fan speed on the slicer scale (0-255), as the TFT's F0 shows it. The M106 macro maps

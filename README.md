@@ -45,7 +45,33 @@ Pi 5 UART at 250000 baud. The changes are based on the TFT firmware source, tag 
 | F0 on the TFT never showed the part fan's speed. | The part fan's speed is sent as `M106 P0 S<n>` whenever it changes. |
 | The TFT's Speed menu sends a bare `M220` and `M221` to read the values. Klipper treats them as `S100` and **resets** speed and flow. | Bare `M220` and `M221` are answered by the bridge; with `S` they go to Klipper. *(Adapted from oterek/klipper-btt-tft-bridge.)* |
 | Babystep (`M290 Z…`) isn't a Klipper command. | It becomes `SET_GCODE_OFFSET Z_ADJUST=… MOVE=1`. `M115` advertises `Cap:BABYSTEPPING:1` *(as in oterek/klipper-btt-tft-bridge)*. |
-| Klipper reports unknown-command errors for the TFT's handshake. | `M92`, `M503`, `M150`, `M108`, `M876`, `M155`, `M211` and `M420` are acknowledged with `ok` and do nothing. |
+| Klipper reports unknown-command errors for the TFT's handshake. | `M108`, `M876`, `M155`, `M211` and `M420` are acknowledged with `ok` and do nothing. |
+
+### Touch-mode menus on TFT firmware V28 (added 2026-11-22)
+
+Based on the V28 source (`TFT/src/User/Menu/*.c`, `API/Mainboard_AckHandler.c`). Tested with a local
+pty harness (`tests/run_test.py`); on-printer testing is still to do.
+
+| TFT menu | What it sends | What the bridge does |
+|---|---|---|
+| Tuning → PID | `M303 E0/E-1 … S<t>` | `PID_CALIBRATE HEATER=extruder/heater_bed TARGET=<t>`, then reports `PID Autotune finished` (or `failed`). Save with `SAVE_CONFIG`. |
+| Tuning → Tune extruder | `M92` query, then `M92 T0 E<steps>` | Reports steps/mm from `rotation_distance`. The new value is applied live with `SET_EXTRUDER_ROTATION_DISTANCE`, and the bridge shows the `rotation_distance` to put in the config. |
+| Tuning → Home offset | `M206` | Reports zeros; changes are refused (not used with Klipper). |
+| Bed leveling → ABL | `G28`, `G29`, `M118 P0 ABL Completed` | `BED_MESH_CALIBRATE`; "ABL Completed" reaches the TFT when the mesh is done. `M115` advertises `Cap:AUTOLEVEL:1` so the menu appears. |
+| Level corner | `G30 E1 X Y` | Moves the probe over X,Y and runs `PROBE`; replies `Bed X: Y: Z:` (or `Z Probe Past Bed` on an error, so the TFT never hangs). |
+| BLTouch | `M280 P0 S10/90/120/160`, `M48` | `BLTOUCH_DEBUG COMMAND=pin_down/pin_up/self_test/reset`; `PROBE_ACCURACY` with its result as `Mean:` / `Standard Deviation:`. |
+| Z align | `G34` | `Z_TILT_ADJUST` (enable with `z_steppers_alignment:1` in the TFT's `config.ini`). |
+| Mesh editor | `M420 V1 T1`, `M421` | Shows Klipper's active mesh (as Marlin's `Bilinear Leveling Grid`); edits are refused. |
+| Machine → Parameter settings | `M503 S0`, then edits | Lists Klipper's live values (steps/mm, max feed rate and acceleration, PID, probe offset, pressure advance, TMC currents). **Read only:** edits are refused, since Klipper keeps them in `printer.cfg`. |
+| Babystep (on exit) and Probe offset | `M851 …` | Reports the probe offset (`[bltouch]`/`[probe]` `z_offset`); changes are refused. |
+| LED colour | `M150 R U B P` | Calls a `_TFT_LED_COLOR R= G= B=` macro (0–1) that you define in Klipper, if you want it. |
+| Custom menu `SCREWS_TILT_CALCULATE` | — | The per-screw results are summarised as one notification, e.g. `Screws: FL base, RL CW 0:15`. |
+| Mesh valid, Mesh tuner, Shut down, BLTouch HS mode, case light | `G26`, `G42`, `M81`, `M401 S`, `M355` | Answered with "not supported with Klipper". |
+
+Replies to translated commands are rewritten on their way back. Every line sent to Klipper is matched
+to its `ok` in order, and the extra `ok`s of multi-line translations are dropped, so the TFT sees one
+per command. TFT firmware V28 stops waiting for an `ok` after 15 s, so long commands (PID, mesh) don't
+block the screen, and their results still arrive when Klipper finishes.
 
 ## Installation
 
@@ -106,7 +132,10 @@ TFT's `config.ini`. After installing or restarting the bridge, switch the TFT to
 
 - Restarting the Klipper service briefly drops the bridge. TFT firmware V27 has no acknowledgement
   timeout, so it simply waits; newer TFT firmware may show "ACK timed out" once.
-- The probe-offset menu (`M851`) isn't translated.
+- Settings changed from the TFT's Parameter settings or Probe offset menus are refused; only the
+  extruder steps/mm (Tune extruder) is applied, and only until Klipper restarts.
+- The TFT's menus are built into its firmware. Items can't be added to Tuning or Leveling without
+  rebuilding it; use the Custom menu (`custom_gcode_N` in `config.ini`) for Klipper commands.
 - Only the newest files fit in the TFT's Onboard SD list. Older files are still printable from the
   web interface.
 - Developed and tested on one printer (Ender 3 Pro, Klipper v0.13, TFT35 E3 V3.0, firmware V27.x).
