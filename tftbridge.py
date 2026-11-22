@@ -19,6 +19,9 @@
 #
 # Repository: https://github.com/ahanifen/tftbridge (fork of https://github.com/oldhui-uk/tftbridge)
 # Licence: GPL-3.0, as the original. Changes made with the help of Claude Code (Claude Opus 5.5).
+# Portions adapted from klipper-btt-tft-bridge (https://github.com/oterek/klipper-btt-tft-bridge),
+# Copyright (c) 2026 Piter (garagescunny), MIT License - see NOTICE: the local answers to bare
+# M220/M221 (and their reply format) and Cap:BABYSTEPPING:1 in M115.
 #   - M20 (file list) is answered here with the newest files only: the TFT's receive buffer is
 #     5000 bytes (V27 CMD_MAX_REV) and Klipper's full list (~1000 files) overflowed both it and the
 #     Klipper pty (lost "End file list" -> TFT stuck loading). The TFT also cuts names at the first
@@ -128,6 +131,8 @@ class TftBridge:
             return self.file_list_reply()
         # Bare M220/M221 are queries on Marlin (the TFT's Speed menu sends them), but in Klipper
         # they default to S100 and RESET speed/flow. Answer them here; with S they go to Klipper.
+        # Adapted from oterek/klipper-btt-tft-bridge (MIT, Copyright (c) 2026 Piter (garagescunny)),
+        # including the "Feedrate: .. FR:" reply that both older and newer TFT firmware parse.
         if cmd == "M220" and not has_s and self.gcodeMove is not None:
             pct = self.gcodeMove.speed_factor * 60. * 100.
             return "echo:Feedrate: %d%% FR:%d%%\nok\n" % (round(pct), round(pct))
@@ -136,6 +141,7 @@ class TftBridge:
         if cmd == "M115":
             version = self.printer.get_start_args().get('software_version', '?')
             return ("FIRMWARE_NAME:Klipper %s FIRMWARE_VERSION:%s MACHINE_TYPE:Ender-3 Pro\n"
+                    # Cap:BABYSTEPPING:1 as in oterek/klipper-btt-tft-bridge (MIT), see NOTICE
                     "Cap:SDCARD:1\nCap:AUTOREPORT_SD_STATUS:0\nCap:AUTOREPORT_TEMP:0\nCap:BABYSTEPPING:1\n"
                     "Cap:EEPROM:0\nCap:PROMPT_SUPPORT:0\nok\n" % (version, version))
         return None

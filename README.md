@@ -15,10 +15,16 @@ This is a fork of **[oldhui-uk/tftbridge](https://github.com/oldhui-uk/tftbridge
 The original is a transparent pass-through. This fork keeps its design (a Klipper `extras` module
 bridging the TFT's serial port to Klipper's pseudo-terminal) and adds the behaviour described below.
 
+Small parts were adapted from **[oterek/klipper-btt-tft-bridge](https://github.com/oterek/klipper-btt-tft-bridge)**
+by **Piter (garagescunny)**, MIT License: answering bare `M220`/`M221` queries locally (and the
+`Feedrate: … FR:` / `Flow:` reply format), and advertising `Cap:BABYSTEPPING:1`. Their copyright and
+licence notice is in [NOTICE](NOTICE).
+
 **The changes in this fork were developed with the help of Claude Code (Claude Opus 5.5).** They were
 written and tested together with the repository owner on their own printer.
 
-Licence: GPL-3.0, the same as the original (see [LICENSE](LICENSE)).
+Licence: GPL-3.0, the same as the original (see [LICENSE](LICENSE)); the MIT-licensed portions are
+listed in [NOTICE](NOTICE).
 
 ## What this fork changes
 
@@ -37,8 +43,8 @@ Pi 5 UART at 250000 baud. The changes are based on the TFT firmware source, tag 
 | The Onboard SD list hung on large libraries. The TFT's receive buffer is 5000 bytes (`CMD_MAX_REV`), and a full `M20` of about 1000 files also overflowed Klipper's pty, which lost the closing `End file list`. | `M20` is answered with the newest files only (`onboard_sd_files`, default 40, capped at 4200 bytes). |
 | The TFT cuts file names at the first space. | Spaces are shown as `_`, and `M23` maps the shown name back to the real file. |
 | F0 on the TFT never showed the part fan's speed. | The part fan's speed is sent as `M106 P0 S<n>` whenever it changes. |
-| The TFT's Speed menu sends a bare `M220` and `M221` to read the values. Klipper treats them as `S100` and **resets** speed and flow. | Bare `M220` and `M221` are answered by the bridge; with `S` they go to Klipper. |
-| Babystep (`M290 Z…`) isn't a Klipper command. | It becomes `SET_GCODE_OFFSET Z_ADJUST=… MOVE=1`. `M115` advertises `Cap:BABYSTEPPING:1`. |
+| The TFT's Speed menu sends a bare `M220` and `M221` to read the values. Klipper treats them as `S100` and **resets** speed and flow. | Bare `M220` and `M221` are answered by the bridge; with `S` they go to Klipper. *(Adapted from oterek/klipper-btt-tft-bridge.)* |
+| Babystep (`M290 Z…`) isn't a Klipper command. | It becomes `SET_GCODE_OFFSET Z_ADJUST=… MOVE=1`. `M115` advertises `Cap:BABYSTEPPING:1` *(as in oterek/klipper-btt-tft-bridge)*. |
 | Klipper reports unknown-command errors for the TFT's handshake. | `M92`, `M503`, `M150`, `M108`, `M876`, `M155`, `M211` and `M420` are acknowledged with `ok` and do nothing. |
 
 ## Installation
@@ -109,5 +115,5 @@ TFT's `config.ini`. After installing or restarting the bridge, switch the TFT to
 ## Related
 
 [oterek/klipper-btt-tft-bridge](https://github.com/oterek/klipper-btt-tft-bridge) is a separate
-rewrite of the original. It talks to Klipper directly in-process instead of through the pty, and it
-also inspired this fork's `M220`/`M221` handling.
+rewrite of the original. It talks to Klipper directly in-process instead of through the pty. The
+parts of it this fork uses are credited above and in [NOTICE](NOTICE).
