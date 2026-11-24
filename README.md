@@ -29,8 +29,9 @@ listed in [NOTICE](NOTICE).
 ## What this fork changes
 
 Tested on a BTT **TFT35 E3 V3.0** with firmware **V27.x** (December 2022), connected to a Raspberry
-Pi 5 UART at 250000 baud. The changes are based on the TFT firmware source, tag `Vx.x.27`
-(`TFT/src/User/API/parseACK.c`, `Printing.c`, `Gcode/gcode.c`).
+Pi 5 UART at 250000 baud. The changes are based on the TFT firmware source: tag `Vx.x.27`, and
+commit `1009040` (2022-12-28), which is the build the "V27.x Dec 28 2022" boards actually run
+(`TFT/src/User/API/parseACK.c`, `Printing.c`, `Menu/PrintingMenu.c`, `Gcode/gcode.c`).
 
 | Problem in Touch mode | What the bridge now does |
 |---|---|
@@ -38,6 +39,8 @@ Pi 5 UART at 250000 baud. The changes are based on the TFT firmware source, tag 
 | The TFT froze while Klipper ran a long command (e.g. a start macro with homing and heat soak), because its status polls queued behind it. | `M105`, `M27`, `M114` and `M115` are answered by the bridge from Klipper's state, so temperatures and progress keep updating. |
 | The TFT didn't notice prints started from Mainsail, Fluidd or Mobileraker, so it had no printing screen and no Pause or Stop buttons. | `M115` reports `Cap:SDCARD:1`, so the TFT (with `onboard_sd` on auto) treats Klipper's virtual SD as an onboard SD card. It follows Klipper's own `File opened:`, `M27` progress and `Done printing file`. |
 | A pause or cancel from the web didn't reach the TFT (Klipper's `M27` still reports progress while paused). | A 1 s watcher sends `//action:paused` and `//action:cancel` when the print state changes. |
+| After any pause the TFT's print timer stayed frozen: it stops the timer on `//action:paused` and only restarts it on `//action:resumed`. | The watcher also sends `//action:resumed` when the print goes from paused back to printing. |
+| The TFT stops polling `M105` and `M114` while it waits for an `ok` (for example behind a long `START_PRINT`), so its temperatures froze and the print screen's Layer box showed `--- mm`. | The watcher pushes Klipper's temperature line every 2 s (always) and an `M114`-format position line every 2 s while a print is running or paused. The TFT parses both whether or not it asked. |
 | `M117` messages didn't appear on the TFT. | They're sent as `//action:notification <text>` and shown on its status screen. |
 | The TFT's Pause, Resume and Stop buttons send Marlin commands. | `M25` → `PAUSE`. `M24` → `RESUME` when paused; otherwise `M24` is forwarded, to start a file selected on the TFT. `M524` → `CANCEL_PRINT`. So your `PAUSE`/`RESUME`/`CANCEL_PRINT` macros run. |
 | The Onboard SD list hung on large libraries. The TFT's receive buffer is 5000 bytes (`CMD_MAX_REV`), and a full `M20` of about 1000 files also overflowed Klipper's pty, which lost the closing `End file list`. | `M20` is answered with the newest files only (`onboard_sd_files`, default 40, capped at 4200 bytes). |
@@ -46,6 +49,14 @@ Pi 5 UART at 250000 baud. The changes are based on the TFT firmware source, tag 
 | The TFT's Speed menu sends a bare `M220` and `M221` to read the values. Klipper treats them as `S100` and **resets** speed and flow. | Bare `M220` and `M221` are answered by the bridge; with `S` they go to Klipper. *(Adapted from oterek/klipper-btt-tft-bridge.)* |
 | Babystep (`M290 Z…`) isn't a Klipper command. | It becomes `SET_GCODE_OFFSET Z_ADJUST=… MOVE=1`. `M115` advertises `Cap:BABYSTEPPING:1` *(as in oterek/klipper-btt-tft-bridge)*. |
 | Klipper reports unknown-command errors for the TFT's handshake. | `M108`, `M876`, `M155`, `M211` and `M420` are acknowledged with `ok` and do nothing. |
+
+The resume push and the temperature/position reports (added 2026-11-23) pass the local pty harness
+(`tests/run_test.py`, 46 checks); on-printer confirmation is still to do.
+
+**Layer display:** for prints the TFT doesn't read from its own SD/USB media (which includes every print
+started through Klipper), the December 2022 firmware always shows the **Z height** in the Layer box,
+whatever `layer_disp_type` says (`Menu/PrintingMenu.c`). A layer number isn't possible there without
+changing the TFT firmware.
 
 ### Touch-mode menus on TFT firmware V28 (added 2026-11-22)
 

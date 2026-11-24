@@ -12,7 +12,10 @@
 #     "Done printing file", M27 progress)
 #   - TFT buttons are translated: M25 -> PAUSE, M24 -> RESUME (when paused), M524 -> CANCEL_PRINT;
 #     Marlin-only commands Klipper doesn't know are acknowledged here
-#   - pause/cancel from other clients and M117 messages are pushed to the TFT as host actions
+#   - pause/resume/cancel from other clients and M117 messages are pushed to the TFT as host actions
+#     (//action:resumed restarts the TFT's print timer, which stops on //action:paused)
+#   - temperatures (always) and the position (while printing) are pushed every 2 s, because the TFT
+#     stops polling M105/M114 while it waits for an "ok"; its Layer box shows Z from these reports
 #   - part fan speed is pushed as "M106 P0 S<n>" (slicer scale) so the TFT's F0 tracks it
 #   - bare M220/M221 (the TFT's Speed menu queries) are answered here; Klipper would treat them
 #     as S100 and reset speed/flow. M290 Z (babystep) -> SET_GCODE_OFFSET Z_ADJUST=.. MOVE=1
