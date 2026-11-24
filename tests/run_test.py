@@ -62,7 +62,7 @@ class ConfigFile:
 
 class Heaters:
     def _get_temp(self, t):
-        return "T:25.0 /0.0 B:24.0 /0.0"
+        return "B:24.0 /0.0 T0:25.0 /0.0"   # Klipper heaters._get_temp order (sorted ids)
 
 class Printer:
     def __init__(self, objs):
@@ -174,7 +174,7 @@ def main():
     s, g = tft_cmd("M401 H", expect_lines=0)
     check("M401 H acked", s == [] and g == ["ok"], (s, g))
     s, g = tft_cmd("M105", expect_lines=0)
-    check("M105 local", g == ["ok T:25.0 /0.0 B:24.0 /0.0"], g)
+    check("M105 local", g == ["ok B:24.0 /0.0 T0:25.0 /0.0"], g)
 
     # --- translations with rewritten replies ---
     s, g = tft_cmd("M303 E0 C8 U1 S220", "// PID parameters: pid_Kp=22.0\nok\n")
@@ -248,6 +248,7 @@ def main():
     tft.lines(timeout=1.2)
     g = tft.lines(timeout=2.5)
     check("no position reports when idle", not any(l.startswith("X:") for l in g), g)
+    check("temperatures pushed when idle", any("T0:" in l and "B:" in l and not l.startswith("ok") for l in g), g)
     b.notify = False
 
     b.handle_disconnect()

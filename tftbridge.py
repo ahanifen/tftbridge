@@ -48,7 +48,7 @@ GCODE_EXTS = ("gcode", "g", "gco")
 
 READ_TIMEOUT = 0.2      # seconds; lets the threads notice a stop request
 WATCH_INTERVAL = 1.0    # seconds between print-state checks for host actions
-POS_EVERY = 2           # push a position report every POS_EVERY watcher ticks while printing
+POS_EVERY = 2           # push temperatures (always) and position (while printing) every POS_EVERY watcher ticks
 # Marlin commands the TFT sends that Klipper doesn't implement: acknowledge, do nothing
 SWALLOW = {"M108", "M876", "M155", "M211", "M420"}
 # Marlin settings commands: Klipper keeps these in printer.cfg, so the TFT's editors are read only
@@ -540,7 +540,7 @@ class TftBridge:
         lastState = None
         lastMsg = None
         lastFan = None
-        posTick = POS_EVERY
+        posTick = 0
         while not self.stopEvent.wait(WATCH_INTERVAL):
             if not self.notify:
                 continue
@@ -557,13 +557,15 @@ class TftBridge:
                 lastState = state
                 # The print screen shows Z from position reports; push one every POS_INTERVAL while a
                 # print is running instead of relying on the TFT's own M114 polling
-                if state in ("printing", "paused") and self.gcodeMove is not None:
-                    posTick += 1
-                    if posTick >= POS_EVERY:
-                        posTick = 0
+                # Temperatures too, at all times: the TFT stops polling M105 while it waits for an "ok"
+                # (e.g. behind a long START_PRINT), which froze its readings during heat-up and soak
+                posTick += 1
+                if posTick >= POS_EVERY:
+                    posTick = 0
+                    if self.heaters is not None:
+                        self.to_tft("%s\n" % (self.heaters._get_temp(self.reactor.monotonic()),))
+                    if state in ("printing", "paused") and self.gcodeMove is not None:
                         self.to_tft(self.position_line())
-                else:
-                    posTick = POS_EVERY
                 msg = self.displayStatus.message if self.displayStatus is not None else None
                 if msg != lastMsg:
                     if msg:
