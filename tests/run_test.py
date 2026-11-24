@@ -232,6 +232,24 @@ def main():
     s, g = tft_cmd("M211 S0", expect_lines=0)
     check("M211 swallowed", s == [] and g == ["ok"], (s, g))
 
+    # --- watcher: resume push and position reports while printing ---
+    ps = types.SimpleNamespace(state="printing")
+    b.printStats, b.displayStatus, b.partFan = ps, None, None
+    b.notify = True
+    g = tft.lines(timeout=2.6)
+    check("position pushed while printing", "X:1.000 Y:2.000 Z:3.000 E:4.000" in g, g)
+    ps.state = "paused"
+    g = tft.lines(timeout=1.5)
+    check("paused pushed", "//action:paused" in g, g)
+    ps.state = "printing"
+    g = tft.lines(timeout=1.5)
+    check("resumed pushed", "//action:resumed" in g, g)
+    ps.state = "standby"
+    tft.lines(timeout=1.2)
+    g = tft.lines(timeout=2.5)
+    check("no position reports when idle", not any(l.startswith("X:") for l in g), g)
+    b.notify = False
+
     b.handle_disconnect()
     print("\n%d failed" % len(FAILS) if FAILS else "\nall passed")
     sys.exit(1 if FAILS else 0)

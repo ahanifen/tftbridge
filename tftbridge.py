@@ -48,6 +48,7 @@ GCODE_EXTS = ("gcode", "g", "gco")
 
 READ_TIMEOUT = 0.2      # seconds; lets the threads notice a stop request
 WATCH_INTERVAL = 1.0    # seconds between print-state checks for host actions
+POS_EVERY = 2           # push a position report every POS_EVERY watcher ticks while printing
 # Marlin commands the TFT sends that Klipper doesn't implement: acknowledge, do nothing
 SWALLOW = {"M108", "M876", "M155", "M211", "M420"}
 # Marlin settings commands: Klipper keeps these in printer.cfg, so the TFT's editors are read only
@@ -143,6 +144,11 @@ class TftBridge:
         self.tftSerial = self.klipperSerial = None
 
     # ---------- helpers ----------
+    def position_line(self):
+        """Marlin M114 format, which the TFT parses whether or not it asked for it."""
+        p = self.gcodeMove._get_gcode_position()
+        return "X:%.3f Y:%.3f Z:%.3f E:%.3f\n" % tuple(p)
+
     def to_tft(self, text):
         with self.writeLock:
             self.tftSerial.write(text.encode())
@@ -167,8 +173,7 @@ class TftBridge:
                 return "Not SD printing.\nok\n"
             return "SD printing byte %d/%d\nok\n" % (self.sdcard.file_position, self.sdcard.file_size)
         if cmd == "M114" and self.gcodeMove is not None:
-            p = self.gcodeMove._get_gcode_position()
-            return "X:%.3f Y:%.3f Z:%.3f E:%.3f\nok\n" % tuple(p)
+            return self.position_line() + "ok\n"
         if cmd == "M20" and self.sdcard is not None:
             return self.file_list_reply()
         # Bare M220/M221 are queries on Marlin (the TFT's Speed menu sends them), but in Klipper
@@ -535,6 +540,7 @@ class TftBridge:
         lastState = None
         lastMsg = None
         lastFan = None
+        posTick = POS_EVERY
         while not self.stopEvent.wait(WATCH_INTERVAL):
             if not self.notify:
                 continue
@@ -543,9 +549,21 @@ class TftBridge:
                 if state != lastState and lastState is not None:
                     if state == "paused":
                         self.to_tft("//action:paused\n")
+                    elif state == "printing" and lastState == "paused":
+                        # The TFT stops its print timer on "paused" and only restarts it on "resumed"
+                        self.to_tft("//action:resumed\n")
                     elif state in ("cancelled", "error"):
                         self.to_tft("//action:cancel\n")
                 lastState = state
+                # The print screen shows Z from position reports; push one every POS_INTERVAL while a
+                # print is running instead of relying on the TFT's own M114 polling
+                if state in ("printing", "paused") and self.gcodeMove is not None:
+                    posTick += 1
+                    if posTick >= POS_EVERY:
+                        posTick = 0
+                        self.to_tft(self.position_line())
+                else:
+                    posTick = POS_EVERY
                 msg = self.displayStatus.message if self.displayStatus is not None else None
                 if msg != lastMsg:
                     if msg:
